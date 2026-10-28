@@ -66,14 +66,32 @@ func NewCustomCA(opts CustomCAOptions) (CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read cert file %s: %w", opts.CertFile, err)
 	}
-	certBlock, _ := pem.Decode(certData)
-	if certBlock == nil || certBlock.Type != "CERTIFICATE" {
+	// Parse every CERTIFICATE block: the first is the signing intermediate;
+	// the rest are additional chain certs (e.g. the eMudhra cross-sign) sent
+	// alongside the leaf so clients can build a path to a trusted root.
+	var chainCerts []*x509.Certificate
+	for rest := certData; ; {
+		block, more := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = more
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		parsed, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse certificate: %w", err)
+		}
+		chainCerts = append(chainCerts, parsed)
+		if len(rest) == 0 {
+			break
+		}
+	}
+	if len(chainCerts) == 0 {
 		return nil, errors.New("no CERTIFICATE block found in cert file")
 	}
-	rootCert, err := x509.ParseCertificate(certBlock.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse certificate: %w", err)
-	}
+	rootCert := chainCerts[0]
 
 	// Verify the key matches the certificate
 	switch pub := rootCert.PublicKey.(type) {
@@ -94,7 +112,7 @@ func NewCustomCA(opts CustomCAOptions) (CA, error) {
 	ca := &CustomCA{
 		signer:   signer,
 		rootCert: rootCert,
-		chain:    []*x509.Certificate{rootCert},
+		chain:    chainCerts,
 		cache:    lru.New(100),
 		group:    new(singleflight.Group),
 	}
@@ -159,14 +177,20 @@ func (ca *CustomCA) GetCert(commonName string) (*tls.Certificate, error) {
 
 // DummyCert creates a leaf certificate signed by the loaded CA key.
 func (ca *CustomCA) DummyCert(commonName string) (*tls.Certificate, error) {
+	// Random serial, like a real CA. Time-derived serials can collide across
+	// concurrent issuances for different hosts.
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("generate serial: %w", err)
+	}
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano() / 100000),
+		SerialNumber: serial,
 		Subject: pkix.Name{
-			CommonName:   commonName,
-			Organization: []string{"mitmproxy"},
+			CommonName: commonName,
 		},
-		NotBefore:  time.Now().Add(-time.Hour * 48),
-		NotAfter:   time.Now().Add(time.Hour * 24 * 365),
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		NotBefore:   time.Now().Add(-time.Hour * 48),
+		NotAfter:    time.Now().Add(time.Hour * 24 * 365),
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
 
@@ -210,46 +234,47 @@ func (ca *CustomCA) DummyCert(commonName string) (*tls.Certificate, error) {
 }
 
 // parsePrivateKeyPEM parses a PEM private key (RSA or EC, PKCS#1 or PKCS#8).
+// Skips EC PARAMETERS blocks (openssl ecparam includes them).
 func parsePrivateKeyPEM(data []byte) (crypto.Signer, error) {
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, errors.New("no PEM block found")
-	}
-
-	switch block.Type {
-	case "RSA PRIVATE KEY":
-		key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, err
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			return nil, errors.New("no PEM block found")
 		}
-		return key, nil
-	case "EC PRIVATE KEY":
-		key, err := x509.ParseECPrivateKey(block.Bytes)
-		if err != nil {
-			return nil, err
+		if block.Type == "EC PARAMETERS" {
+			continue
 		}
-		return key, nil
-	case "PRIVATE KEY":
-		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, err
-		}
-		switch k := key.(type) {
-		case *rsa.PrivateKey:
-			return k, nil
-		case *ecdsa.PrivateKey:
-			return k, nil
+		switch block.Type {
+		case "RSA PRIVATE KEY":
+			key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+			if err != nil {
+				return nil, err
+			}
+			return key, nil
+		case "EC PRIVATE KEY":
+			key, err := x509.ParseECPrivateKey(block.Bytes)
+			if err != nil {
+				return nil, err
+			}
+			return key, nil
+		case "PRIVATE KEY":
+			key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+			if err != nil {
+				return nil, err
+			}
+			switch k := key.(type) {
+			case *rsa.PrivateKey:
+				return k, nil
+			case *ecdsa.PrivateKey:
+				return k, nil
+			default:
+				return nil, fmt.Errorf("unsupported private key type: %T", key)
+			}
 		default:
-			return nil, fmt.Errorf("unsupported private key type: %T", key)
+			return nil, fmt.Errorf("unsupported PEM block type: %s", block.Type)
 		}
-	default:
-		return nil, fmt.Errorf("unsupported PEM block type: %s", block.Type)
 	}
-}
-
-// StorePath helper (used by save/export if needed in future).
-func (ca *CustomCA) storePath() string {
-	return ca.StorePath
 }
 
 var _ CA = (*CustomCA)(nil)
